@@ -1,0 +1,213 @@
+from data_provider.data_factory import data_provider
+from exp.exp_basic import Exp_Basic
+from utils.tools import EarlyStopping, adjust_learning_rate, visual
+from utils.metrics import metric
+import torch
+import torch.nn as nn
+from torch import optim
+import os
+import time
+import warnings
+import numpy as np
+
+warnings.filterwarnings('ignore')
+
+
+
+class CustomLoss(nn.Module):
+    def __init__(self):
+        super(CustomLoss, self).__init__()
+    
+    def forward(self, y_pred, y_true):
+        
+        loss = abs((y_pred-y_true))
+        
+        return loss
+    
+
+custom_loss = CustomLoss()
+
+
+
+class Exp_Imputation(Exp_Basic):
+    def __init__(self, args):
+        super(Exp_Imputation, self).__init__(args)
+
+    def _build_model(self):
+        model = self.model_dict[self.args.model].Model(self.args).float()
+
+        if self.args.use_multi_gpu and self.args.use_gpu:
+            model = nn.DataParallel(model, device_ids=self.args.device_ids)
+        return model
+
+    def _get_data(self, flag,epoch=0):
+        data_set, data_loader = data_provider(self.args, flag,epoch=epoch)
+        return data_set, data_loader
+
+    def _select_optimizer(self):
+        model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate, betas=(0.9,0.99))
+        return model_optim
+
+
+
+    def train(self, setting):
+       
+        time_now = time.time()
+
+        model_optim = self._select_optimizer()
+
+        
+        os.makedirs(self.args.save_dir_path, exist_ok=True)  
+
+        for epoch in range(self.args.train_epochs):
+            print('epoch = ',epoch)
+            iter_count = 0
+
+            model_optim.zero_grad()
+
+            with open(self.args.result_path,'a+') as f:
+                print('epoch = ',epoch,file=f)
+
+            # ###########################train###########################
+            train_loss = []
+            train_data, train_loader = self._get_data(flag='train',epoch=epoch)
+
+            train_steps = len(train_loader)
+
+            self.model.train()
+            epoch_time = time.time()
+            running_loss_X1 = 0
+            sum_loss_X1 = 0
+
+            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(train_loader):
+                iter_count += 1
+                
+
+                batch_x = batch_x.float().to(self.device)
+                batch_x_mark = batch_x_mark.float().to(self.device)
+
+                # set mask  
+                mask = torch.ones_like(batch_x).to(self.device)
+                # epsilon = 1e-6 
+                mask[torch.abs(batch_x) == 0.0] = 2  
+                
+                non_zero_indices = torch.nonzero(batch_x != 0.0, as_tuple=False)
+                
+                num_to_mask = int(self.args.mask_rate * non_zero_indices.size(0))   
+                mask_indices = non_zero_indices[torch.randperm(non_zero_indices.size(0))[:num_to_mask]]
+                
+                mask[mask_indices[:, 0], mask_indices[:, 1], mask_indices[:, 2]] = 0
+                
+                mask[(mask != 0) & (mask != 2)] = 1
+
+                
+                mask1=mask.clone()
+                mask1[batch_x == 0.0] = 0   
+
+                batch_x1 = batch_x * mask1   
+
+                outputs = self.model(batch_x1, batch_x_mark, None, None, mask1,is_history=False)
+
+                loss = custom_loss(outputs[mask == 0], batch_x[mask == 0])
+
+                if loss.numel() > 0:
+                    running_loss_X1 += torch.sum(loss)/loss.numel()
+            
+            sum_loss_X1= running_loss_X1 /train_steps
+
+            train_loss.append(sum_loss_X1.item())
+
+
+            sum_loss_X1.backward()
+            model_optim.step()
+
+            with open(self.args.result_path,'a+') as f:
+                print('epoch sum loss = ',sum_loss_X1.item(),file=f)
+
+            if (epoch + 1) % 100 == 0:
+                file_path = os.path.join(self.args.save_dir_path, f'X1_model_epoch_{epoch + 1}.pth')
+                torch.save(self.model.state_dict(), file_path)
+                print(f"Model X1 saved at {file_path}")
+
+
+
+            # ###########################test###########################
+            self.test(setting,epoch=epoch)
+
+    def test(self, setting, test=0,epoch=0):
+        test_data, test_loader = self._get_data(flag='test',epoch=epoch)
+
+        self.model.eval()
+
+        test_steps = len(test_loader)
+
+        sum_er = 0.0
+        sum_mae = 0.0
+        sum_mse = 0.0
+        sum_rse = 0.0
+        sum_rmse = 0.0
+        sum_mape = 0.0
+        sum_mspe = 0.0
+
+        with torch.no_grad():
+            for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(test_loader):
+
+                batch_x = batch_x.float().to(self.device)
+                batch_x_mark = batch_x_mark.float().to(self.device)
+
+                # set mask   
+                print(f'batch_x: {batch_x}')
+                mask = torch.rand_like(batch_x).to(self.device)
+                epsilon = 1e-6
+                mask[torch.abs(batch_x) < epsilon] = 2  
+                
+
+                # mask values based on mask rate
+                mask[batch_x != 0.0] = torch.where(mask[batch_x != 0] <= self.args.mask_rate, 0, mask[batch_x != 0])  # masked
+                mask[batch_x != 0.0] = torch.where(mask[batch_x != 0] > self.args.mask_rate, 1, mask[batch_x != 0])  # remain
+                mask1=mask.clone()
+                mask1[batch_x == 0.0] = 0  
+                batch_x1 = batch_x * mask1   
+
+                # imputation
+                outputs = self.model(batch_x1, batch_x_mark, None, None, mask1,is_history=False)
+
+                # eval
+                pred = outputs.clone()  
+                pred = pred[mask == 0]  
+                true = batch_x.clone()  
+                true = true[mask == 0]
+                er, mae, mse,rse, rmse, mape, mspe = metric(pred, true)
+
+                sum_er += er
+                sum_mae += mae 
+                sum_mse += mse
+                sum_rse += rse
+                sum_rmse += rmse
+                sum_mape += mape
+                sum_mspe += mspe
+
+        
+
+        sum_er = sum_er / test_steps
+        sum_mae = sum_mae / test_steps
+        sum_mse = sum_mse / test_steps
+        sum_rse = sum_rse / test_steps
+        sum_rmse = sum_rmse / test_steps
+        sum_mape = sum_mape / test_steps
+        sum_mspe = sum_mspe / test_steps  
+
+        # result save
+        with open(self.args.result_path,'a+') as f:
+            print('sample_rate:',self.args.sample_rate,file=f)
+            #print('epoch:[{}]/[{}]'.format(epoch+1,num_epoches),file=f)
+            print('test_er:',sum_er.item(),file=f)
+            print('test_mae:',sum_mae.item(),file=f)
+            print('test_mse:',sum_mse.item(),file=f)
+            print('test_rse:',sum_rse.item(),file=f)
+            print('test_rmse:',sum_rmse.item(),file=f)
+            print('test_mape:',sum_mape.item(),file=f)
+            print('test_mspe:',sum_mae.item(),file=f)
+            print('',file=f)
+
+        
